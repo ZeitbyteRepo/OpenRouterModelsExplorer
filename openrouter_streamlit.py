@@ -25,6 +25,14 @@ if 'visible_columns' not in st.session_state:
         'description': False, 'created': False, 'is_moderated': True
     }
 
+def convert_to_microunits(price):
+    """Convert price to micro-units (1 unit = 1/1,000,000)"""
+    return price * 1_000_000
+
+def format_price_microunits(price):
+    """Format price in micro-units for display"""
+    return f"${price:,.2f}µ"
+
 def fetch_models():
     """Fetch models from OpenRouter API"""
     url = "https://openrouter.ai/api/v1/models"
@@ -48,14 +56,23 @@ def fetch_models():
         # Process models data
         processed_models = []
         for model in data.get('data', []):
+            # Skip AutoRouter entry
+            if model.get('id', '') == 'openrouter/auto':
+                continue
+                
             is_moderated = model.get('top_provider', {}).get('is_moderated', False)
+            # Convert prices to micro-units
+            prompt_price = convert_to_microunits(float(model.get('pricing', {}).get('prompt', 0)))
+            completion_price = convert_to_microunits(float(model.get('pricing', {}).get('completion', 0)))
+            image_price = convert_to_microunits(float(model.get('pricing', {}).get('image', 0)))
+            
             processed_models.append({
                 'id': model.get('id', 'N/A'),
                 'name': model.get('name', 'N/A'),
                 'context_length': model.get('context_length', 0),
-                'prompt_price': float(model.get('pricing', {}).get('prompt', 0)),
-                'completion_price': float(model.get('pricing', {}).get('completion', 0)),
-                'image_price': float(model.get('pricing', {}).get('image', 0)),
+                'prompt_price': prompt_price,
+                'completion_price': completion_price,
+                'image_price': image_price,
                 'modality': model.get('architecture', {}).get('modality', 'N/A'),
                 'tokenizer': model.get('architecture', {}).get('tokenizer', 'N/A'),
                 'provider_context_length': model.get('top_provider', {}).get('context_length', 'N/A'),
@@ -75,10 +92,18 @@ def display_statistics(df, column):
         stats = df[column].describe()
         st.write(f"Statistics for {column}:")
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Mean", f"{stats['mean']:.6f}")
-        col2.metric("Median", f"{stats['50%']:.6f}")
-        col3.metric("Min", f"{stats['min']:.6f}")
-        col4.metric("Max", f"{stats['max']:.6f}")
+        
+        # Format values based on column type
+        if column in ['prompt_price', 'completion_price', 'image_price']:
+            col1.metric("Mean", format_price_microunits(stats['mean']))
+            col2.metric("Median", format_price_microunits(stats['50%']))
+            col3.metric("Min", format_price_microunits(stats['min']))
+            col4.metric("Max", format_price_microunits(stats['max']))
+        else:
+            col1.metric("Mean", f"{stats['mean']:.2f}")
+            col2.metric("Median", f"{stats['50%']:.2f}")
+            col3.metric("Min", f"{stats['min']:.2f}")
+            col4.metric("Max", f"{stats['max']:.2f}")
         
         # Distribution plot
         fig = px.histogram(
@@ -86,7 +111,7 @@ def display_statistics(df, column):
             x=column,
             title=f'{column} Distribution',
             hover_data=['name'],  # Show model name on hover
-            labels={column: column, 'count': 'Number of Models'},
+            labels={column: f"{column} ({get_unit_label(column)})", 'count': 'Number of Models'},
             color='is_moderated'  # Color by moderation status
         )
         st.plotly_chart(fig, use_container_width=True)
@@ -115,6 +140,20 @@ def display_statistics(df, column):
         )
         
         st.plotly_chart(fig, use_container_width=True)
+
+def get_unit_label(column):
+    """Get the unit label for a column"""
+    if column in ['prompt_price', 'completion_price', 'image_price']:
+        return "micro-units (µ)"
+    elif column == 'context_length':
+        return "tokens"
+    return ""
+
+def filter_numeric_column(df, col, min_val, max_val):
+    """Helper function to filter numeric columns"""
+    if pd.api.types.is_numeric_dtype(df[col]):
+        return df[(df[col] >= min_val) & (df[col] <= max_val)]
+    return df
 
 def main():
     st.title("OpenRouter Models Explorer")
@@ -162,29 +201,57 @@ def main():
                 df['id'].str.contains(search_term, case=False)
             ]
         
-        # Add filters for each column
-        for col in df.columns:
-            if col not in ['name', 'id', 'description', 'created']:
-                st.sidebar.subheader(f"Filter {col}")
-                if df[col].dtype in ['int64', 'float64']:
-                    # Numeric filter
-                    min_val = float(df[col].min())
-                    max_val = float(df[col].max())
-                    range_vals = st.sidebar.slider(
-                        f"{col} range",
-                        min_val, max_val,
-                        (min_val, max_val)
+        # Price filters
+        st.sidebar.subheader("Price Filters (in micro-units µ)")
+        price_cols = ['prompt_price', 'completion_price', 'image_price']
+        for col in price_cols:
+            min_price = float(df[col].min())
+            max_price = float(df[col].max())
+            if min_price != max_price:
+                col1, col2 = st.sidebar.columns(2)
+                with col1:
+                    min_val = st.number_input(f"Min {col} (µ)", 
+                                            min_value=min_price,
+                                            max_value=max_price,
+                                            value=min_price,
+                                            format="%.2f")
+                with col2:
+                    max_val = st.number_input(f"Max {col} (µ)",
+                                            min_value=min_price,
+                                            max_value=max_price,
+                                            value=max_price,
+                                            format="%.2f")
+                df = filter_numeric_column(df, col, min_val, max_val)
+        
+        # Context length filter
+        st.sidebar.subheader("Context Length Filter")
+        if 'context_length' in df.columns:
+            min_ctx = int(df['context_length'].min())
+            max_ctx = int(df['context_length'].max())
+            if min_ctx != max_ctx:
+                ctx_range = st.sidebar.slider(
+                    "Context Length (tokens)",
+                    min_value=min_ctx,
+                    max_value=max_ctx,
+                    value=(min_ctx, max_ctx),
+                    step=1024  # Common context window increment
+                )
+                df = filter_numeric_column(df, 'context_length', ctx_range[0], ctx_range[1])
+        
+        # Categorical filters
+        st.sidebar.subheader("Categorical Filters")
+        categorical_cols = ['modality', 'tokenizer']
+        for col in categorical_cols:
+            if col in df.columns:
+                options = sorted(df[col].unique().tolist())
+                if len(options) > 1:
+                    selected = st.sidebar.multiselect(
+                        f"Select {col}",
+                        options=options,
+                        default=options
                     )
-                    df = df[
-                        (df[col] >= range_vals[0]) &
-                        (df[col] <= range_vals[1])
-                    ]
-                else:
-                    # Categorical filter
-                    options = ['All'] + sorted(df[col].unique().tolist())
-                    selected = st.sidebar.selectbox(f"Select {col}", options)
-                    if selected != 'All':
-                        df = df[df[col] == selected]
+                    if selected:
+                        df = df[df[col].isin(selected)]
         
         # Main content area
         tab1, tab2 = st.tabs(["Data View", "Statistics"])
@@ -223,10 +290,10 @@ def main():
                 hide_index=True,
                 column_config={
                     'description': st.column_config.TextColumn(width='medium'),
-                    'context_length': st.column_config.NumberColumn(format="%d"),
-                    'prompt_price': st.column_config.NumberColumn(format="$%.6f"),
-                    'completion_price': st.column_config.NumberColumn(format="$%.6f"),
-                    'image_price': st.column_config.NumberColumn(format="$%.6f"),
+                    'context_length': st.column_config.NumberColumn(format="%d tokens"),
+                    'prompt_price': st.column_config.NumberColumn(format="$%.2fµ"),
+                    'completion_price': st.column_config.NumberColumn(format="$%.2fµ"),
+                    'image_price': st.column_config.NumberColumn(format="$%.2fµ"),
                     'is_moderated': st.column_config.CheckboxColumn("Moderated")
                 }
             )
